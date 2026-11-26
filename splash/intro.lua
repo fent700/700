@@ -772,7 +772,7 @@ shot({
         end
         local i = math.max(1, want)
         local prev = s.path[math.max(1, i - 1)].Position
-        local k = i == 1 and 1 or easeOut((lt - s.times[i]) / 0.3)
+        local k = i == 1 and 1 or smooth((lt - s.times[i]) / 0.32)  -- ease in AND out: no jolt on the first frame
         local follow = prev:Lerp(s.path[i].Position, k)
         local xz = flat(s.axis):Lerp(flat(follow), 0.6)
         local camY = follow.Y + 40
@@ -1270,24 +1270,40 @@ local songClock0 = nil
 local finishing = false
 local wantSkip = false
 
+-- The picture runs on os.clock and is only STEERED by Sound.TimePosition. TimePosition reports in
+-- coarse steps and lags after frame hitches (e.g. the cross-world teleport into Twilight); snapping to
+-- it made the camera jump backwards = a visible bounce. Now: drift is eased out by at most 25% speed
+-- change, a big lag (we stalled) is jumped FORWARD, and time never runs backwards.
+local lastSteer = nil
 local function songTime()
     if OPT.freezeAt then return OPT.freezeAt end
     if not songClock0 then return 0 end
-    local now = os.clock() - songClock0
+    local clockNow = os.clock()
+    local dt = lastSteer and math.clamp(clockNow - lastSteer, 0, 0.25) or 0
+    lastSteer = clockNow
+    local now = clockNow - songClock0
     if sound and sound.IsPlaying and sound.TimeLength > 0 then
-        local tp = sound.TimePosition
-        if math.abs(tp - now) > 0.09 then
-            songClock0 = os.clock() - tp
-            now = tp
+        local err = sound.TimePosition - now
+        if err > 0.3 then
+            songClock0 -= err
+            now += err
+        elseif math.abs(err) > 0.015 then
+            local step = math.clamp(err, -dt * 0.25, dt * 0.25)
+            songClock0 -= step
+            now += step
         end
     end
     return now
 end
 
--- picture time: the song position minus output latency (see AUDIO_LATENCY)
+-- picture time: the song position minus output latency (see AUDIO_LATENCY); monotonic
+local lastPicture = 0
 local function pictureTime()
     if OPT.freezeAt then return OPT.freezeAt end
-    return math.max(0, songTime() - (sound and AUDIO_LATENCY or 0))
+    local t = math.max(0, songTime() - (sound and AUDIO_LATENCY or 0))
+    if t < lastPicture then t = lastPicture end
+    lastPicture = t
+    return t
 end
 
 local function loadAudio()
@@ -1333,15 +1349,16 @@ end
 -- Pets follow the character, and BGSI pets are BIG: any of ours that drifts between the lens and the
 -- character (or right up against the lens) is faded out for that frame instead of filling the shot.
 local petRender = nil
+-- every rendered pet that belongs to a player: { model, mine }. (Owner-less pets are world props.)
 local petCache, petCacheAt = {}, 0
-local function myPets()
+local function playerPets()
     if os.clock() - petCacheAt < 0.5 then return petCache end
     petCacheAt = os.clock()
     local list = {}
     if petRender and type(petRender.Pets) == "table" then
         for _, v in pairs(petRender.Pets) do
-            if type(v) == "table" and v.Owner == player and typeof(v.Model) == "Instance" and v.Model.Parent then
-                list[#list + 1] = v.Model
+            if type(v) == "table" and typeof(v.Owner) == "Instance" and typeof(v.Model) == "Instance" and v.Model.Parent then
+                list[#list + 1] = { v.Model, v.Owner == player }
             end
         end
     end
@@ -1371,9 +1388,7 @@ local function fadeBubbles(camPos, target)
     local head = char and char:FindFirstChild("Head")
     for _, b in ipairs(folder:GetChildren()) do
         if b:IsA("BasePart") then
-            local r = math.max(b.Size.X, b.Size.Y, b.Size.Z) / 2
-            local mine = head and (b.Position - head.Position).Magnitude < r + 6
-            local hide = (not mine) or sphereBlocks(b.Position, r, camPos, target)
+            local hide = true  -- no gum bubbles in the intro, ours included (BGSI settings are never touched)
             if hide ~= (bubbleHidden[b] == true) then
                 bubbleHidden[b] = hide or nil
                 b.LocalTransparencyModifier = hide and 1 or 0
@@ -1385,9 +1400,12 @@ onRestore(function()
     for b in pairs(bubbleHidden) do pcall(function() b.LocalTransparencyModifier = 0 end) end
 end)
 
+-- our pets fade only while they block the shot; other players' pets stay hidden the whole intro
+-- (done client-side -- the intro never switches a BGSI "hide" setting ON)
 local function fadePets(camPos, target)
     pcall(fadeBubbles, camPos, target)
-    for _, m in ipairs(myPets()) do
+    for _, entry in ipairs(playerPets()) do
+        local m, mine = entry[1], entry[2]
         local info = petInfo[m]
         if not info then
             local parts, emitters = {}, {}
@@ -1399,9 +1417,8 @@ local function fadePets(camPos, target)
             info = { parts = parts, emitters = emitters, r = ok and size and size.Magnitude / 2 or 3, hidden = false }
             petInfo[m] = info
         end
-        local okBox, boxCF = pcall(function() return m:GetBoundingBox() end)
-        local p = okBox and boxCF.Position or m:GetPivot().Position
-        local hide = sphereBlocks(p, info.r, camPos, target)
+        local hide = true  -- no pets in the intro, ours included (they're huge and swallow close-ups)
+        local _ = mine
         if hide ~= info.hidden then
             info.hidden = hide
             for _, part in ipairs(info.parts) do pcall(function() part.LocalTransparencyModifier = hide and 1 or 0 end) end
@@ -1436,38 +1453,8 @@ local function fadeCharNear(camPos)
 end
 onRestore(function() pcall(setCharFade, 0) end)
 
--- Show OUR pets + bubbles for the intro even if they're hidden in BGSI settings, and hide everyone
--- else's pets. The server throttles SetSetting (3 calls in one frame -> only 1 lands), so changes go out
--- 0.6s apart on a background thread during the loading screen, and are put back the same way.
-local SETTING_GAP = 0.6
-local function applyIntroSettings()
-    local LocalData = gameModule("Client.Framework.Services.LocalData")
-    local settings = nil
-    pcall(function() local d = LocalData and LocalData:Get() settings = d and d.Settings end)
-    local rem = remote()
-    if not (rem and type(settings) == "table") then return end
-    local changed = {}
-    for _, pair in ipairs({ { "Hide All Pets", false }, { "Hide Others Pets", true }, { "Hide Bubbles", false } }) do
-        local cur = settings[pair[1]]
-        if type(cur) == "boolean" and cur ~= pair[2] then changed[#changed + 1] = { pair[1], pair[2], cur } end
-    end
-    if #changed == 0 then return end
-    onRestoreGame(function()
-        task.spawn(function()
-            for i, c in ipairs(changed) do
-                if i > 1 then task.wait(SETTING_GAP) end
-                pcall(function() rem:FireServer("SetSetting", c[1], c[3]) end)
-            end
-        end)
-    end)
-    task.spawn(function()
-        for i, c in ipairs(changed) do
-            if i > 1 then task.wait(SETTING_GAP) end
-            if restored then return end
-            pcall(function() rem:FireServer("SetSetting", c[1], c[2]) end)
-        end
-    end)
-end
+-- NOTE: the intro never changes BGSI settings (Hide All Pets / Hide Bubbles / ...). Pets and gum
+-- bubbles are hidden client-side for its duration by fadePets/fadeBubbles above, and come back untouched.
 
 -- take over the screen the way the game's own cutscenes do, and remember how to give it back
 local function takeOver()
@@ -1632,8 +1619,6 @@ local function run()
         if h then c.CameraSubject = h end
     end)
 
-    applyIntroSettings()
-    settle()
     sound = loadAudio()
     captionAsset = loadCaptions()
     if captionAsset then
@@ -1660,6 +1645,23 @@ local function run()
 
     takeOver()
     cam.CameraType = Enum.CameraType.Scriptable
+
+    -- pre-warm: while the screen is still black, point the camera at every location for a few frames so
+    -- meshes/textures are uploaded now -- first-time rendering mid-intro caused ~0.2s hitches at cuts
+    if not OPT.freezeAt then
+        loading.Visible = true
+        loadingText.Text = "LOADING WORLD"
+        for _, s in ipairs(list) do
+            local poi = (s.stand and s.stand.Position) or (s.spots and s.spots[1] and s.spots[1].Position)
+                or (s.path and s.path[1] and s.path[1].Position) or s.panelPos or s.center or s.from
+            if typeof(poi) == "Vector3" then
+                for _, off in ipairs({ V3(28, 14, 28), V3(-28, 20, -20) }) do
+                    cam.CFrame = CFrame.lookAt(poi + off, poi)
+                    for _ = 1, 3 do RunService.RenderStepped:Wait() end
+                end
+            end
+        end
+    end
 
     track(UIS.InputBegan:Connect(function(input)
         local k = input.KeyCode
@@ -1716,10 +1718,15 @@ local function run()
             end
         end
         local ok, cf, fov = pcall(cur.frame, cur, clamp01(lt / cur.len), lt)
+        if OPT.debugLog and ok and cf then
+            local log = genv._splashIntroLog or {}
+            genv._splashIntroLog = log
+            log[#log + 1] = { os.clock(), now, cur.name, cf.Position, sound and sound.TimePosition or -1 }
+        end
         if ok and cf then
             cam.CFrame = cf
             if fov then cam.FieldOfView = fov end
-            if not cur.noChar then pcall(fadePets, cf.Position, cur.focusPoint or (charPos() + V3(0, 1.5, 0))) end
+            pcall(fadePets, cf.Position, (not cur.noChar) and (cur.focusPoint or (charPos() + V3(0, 1.5, 0))) or nil)
             pcall(fadeCharNear, cf.Position)
         elseif not ok then
             warn("[SplashIntro] frame " .. cur.name .. ": " .. tostring(cf))
